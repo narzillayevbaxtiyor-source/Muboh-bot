@@ -3,7 +3,7 @@ import json
 import time
 import asyncio
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import requests
 from telegram import Update
@@ -17,27 +17,26 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = int((os.getenv("CHAT_ID") or "0").strip() or "0")
 
 # =======================
-# SETTINGS (sozlash mumkin)
+# SETTINGS
 # =======================
-INTERVAL = os.getenv("INTERVAL", "3m")  # 3m
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "10"))  # tez-tez tekshiradi (signal tez chiqishi uchun)
-TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))  # TOP 10 gainers ro'yxatini yangilash
+INTERVAL = os.getenv("INTERVAL", "3m")
+SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "10"))          # signal tezligi
+TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))       # top10 yangilash
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "80"))
 
-# Impulse sharti: (close-open)/open >= IMPULSE_PCT
-IMPULSE_PCT = float(os.getenv("IMPULSE_PCT", "0.004"))  # 0.004 = 0.40% (3m uchun moslash)
-# Pullback sharti: pullback candle bearish bo'lishi shart
+# Impulse: (close-open)/open >= IMPULSE_PCT
+IMPULSE_PCT = float(os.getenv("IMPULSE_PCT", "0.004"))  # 0.40% default (3m uchun)
 REQUIRE_BEARISH_PULLBACK = (os.getenv("REQUIRE_BEARISH_PULLBACK", "1").strip() != "0")
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# Binance API fallback
+# Binance API fallback (restricted location bo'lsa ham ko'p joyda ishlaydi)
 BINANCE_BASES = [
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com",
-    "https://data-api.binance.vision",  # ko'p joyda ishlaydi
+    "https://data-api.binance.vision",
 ]
 
 
@@ -48,7 +47,14 @@ def now_ts() -> int:
     return int(time.time())
 
 
-def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 10) -> dict:
+def safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 10):
     last_err = None
     for base in BINANCE_BASES:
         url = base + path
@@ -59,24 +65,17 @@ def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 10) -
         except Exception as e:
             last_err = e
             continue
-    raise RuntimeError(f"All Binance endpoints failed for {path}. Last error: {last_err}")
-
-
-def safe_float(x) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
+    raise RuntimeError(f"All Binance endpoints failed: {path}. Last error: {last_err}")
 
 
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
-        return {"symbols": {}, "last_top_refresh": 0}
+        return {"symbols": {}, "last_top_refresh": 0, "top10": []}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"symbols": {}, "last_top_refresh": 0}
+        return {"symbols": {}, "last_top_refresh": 0, "top10": []}
 
 
 def save_state(state: dict) -> None:
@@ -86,42 +85,13 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE_FILE)
 
 
-@dataclass
-class SymbolState:
-    stage: str = "WAIT_IMPULSE"  # WAIT_IMPULSE -> WAIT_PULLBACK -> WAIT_BREAK_HIGH -> IN_POSITION
-    impulse_candle_time: int = 0
-
-    pullback_high: float = 0.0
-    pullback_low: float = 0.0
-    pullback_close_time: int = 0
-
-    in_position: bool = False
-    buy_time: int = 0
-    buy_price: float = 0.0
-
-    last_closed_time: int = 0
-    last_closed_low: float = 0.0
-
-    last_signal: str = ""  # to prevent duplicates
+def format_price(p: float) -> str:
+    if p >= 1:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    return f"{p:.10f}".rstrip("0").rstrip(".")
 
 
 def parse_klines(klines: list) -> List[dict]:
-    """
-    Binance kline array:
-    [
-      [
-        0 openTime,
-        1 open,
-        2 high,
-        3 low,
-        4 close,
-        5 volume,
-        6 closeTime,
-        ...
-      ],
-      ...
-    ]
-    """
     out = []
     for k in klines:
         out.append({
@@ -147,14 +117,8 @@ def is_bearish(c: dict) -> bool:
     return c["close"] < c["open"]
 
 
-def format_price(p: float) -> str:
-    if p >= 1:
-        return f"{p:.6f}".rstrip("0").rstrip(".")
-    return f"{p:.10f}".rstrip("0").rstrip(".")
-
-
 # =======================
-# Binance data functions
+# Binance data
 # =======================
 def get_exchange_info_symbols_usdt() -> set:
     data = http_get_json("/api/v3/exchangeInfo")
@@ -170,13 +134,11 @@ def get_exchange_info_symbols_usdt() -> set:
 
 def get_top10_gainers_usdt(tradable_usdt: set) -> List[str]:
     tickers = http_get_json("/api/v3/ticker/24hr")
-    # filter USDT & tradable
     rows = []
     for t in tickers:
         sym = t.get("symbol", "")
         if sym not in tradable_usdt:
             continue
-        # exclude leveraged tokens / weird (xUP/xDOWN) - xohlasang olib tashla
         if sym.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             continue
         p = safe_float(t.get("priceChangePercent", 0))
@@ -190,18 +152,15 @@ def get_klines(symbol: str, interval: str, limit: int) -> List[dict]:
     return parse_klines(data)
 
 
-def get_mark_price(symbol: str) -> float:
-    # spot uchun "ticker/price" yetarli
+def get_spot_price(symbol: str) -> float:
     data = http_get_json("/api/v3/ticker/price", params={"symbol": symbol})
     return safe_float(data.get("price", 0))
 
 
 # =======================
-# Telegram helpers
+# Telegram send
 # =======================
 async def tg_send(app: Application, text: str) -> None:
-    if not BOT_TOKEN or CHAT_ID == 0:
-        return
     try:
         await app.bot.send_message(chat_id=CHAT_ID, text=text)
     except Exception:
@@ -209,15 +168,34 @@ async def tg_send(app: Application, text: str) -> None:
 
 
 # =======================
-# Core logic
+# State per symbol
 # =======================
+@dataclass
+class SymbolState:
+    stage: str = "WAIT_IMPULSE"   # WAIT_IMPULSE -> WAIT_PULLBACK -> WAIT_BREAK_HIGH -> IN_POSITION
+    impulse_candle_close_time: int = 0
+
+    pullback_high: float = 0.0
+    pullback_low: float = 0.0
+    pullback_close_time: int = 0
+
+    in_position: bool = False
+    buy_price: float = 0.0
+    buy_time: int = 0
+
+    last_closed_time: int = 0
+    last_closed_low: float = 0.0
+
+    last_signal: str = ""
+
+
 def ensure_symbol_state(state: dict, symbol: str) -> SymbolState:
     s = state["symbols"].get(symbol)
     if not s:
         st = SymbolState()
         state["symbols"][symbol] = asdict(st)
         return st
-    # merge defaults
+    # merge defaults safely
     st = SymbolState(**{**asdict(SymbolState()), **s})
     state["symbols"][symbol] = asdict(st)
     return st
@@ -227,66 +205,57 @@ def update_symbol_state_dict(state: dict, symbol: str, st: SymbolState) -> None:
     state["symbols"][symbol] = asdict(st)
 
 
+# =======================
+# Trading logic
+# =======================
 def analyze_symbol(symbol: str, st: SymbolState, klines: List[dict], last_price: float) -> Tuple[SymbolState, Optional[str]]:
-    """
-    Qoidalar:
-    1) WAIT_IMPULSE: oxirgi yopilgan sham impulse bo'lsa -> WAIT_PULLBACK
-    2) WAIT_PULLBACK: keyingi yopilgan sham pullback (bearish) bo'lsa:
-         pullback_high/low saqlanadi -> WAIT_BREAK_HIGH
-       aks holda: (impulse ketidan pullback kelmasa) reset WAIT_IMPULSE
-    3) WAIT_BREAK_HIGH: narx pullback_high dan yuqoriga chiqsa -> BUY va IN_POSITION
-    4) IN_POSITION: har safar yangi CLOSED sham kelganda last_closed_low yangilanadi.
-       Agar narx last_closed_low dan pastga tushsa -> SELL va reset WAIT_IMPULSE
-    """
     if len(klines) < 5:
         return st, None
 
-    # always track last closed candle
-    last_closed = klines[-2]  # -1 open candle, -2 closed
+    # -1 is current open candle, -2 is last closed candle
+    last_closed = klines[-2]
+
+    # Track last closed low (used for SELL)
     if last_closed["close_time"] != st.last_closed_time:
         st.last_closed_time = last_closed["close_time"]
         st.last_closed_low = last_closed["low"]
 
     signal = None
 
-    # duplicate-signal guard key
     def sig_key(kind: str, t: int) -> str:
         return f"{kind}:{t}"
 
     if st.stage == "WAIT_IMPULSE":
-        # detect impulse on last closed candle
         if is_bull_impulse(last_closed):
             st.stage = "WAIT_PULLBACK"
-            st.impulse_candle_time = last_closed["close_time"]
+            st.impulse_candle_close_time = last_closed["close_time"]
 
     elif st.stage == "WAIT_PULLBACK":
-        # need the candle right after impulse
-        # Find impulse candle index by close_time
+        # find impulse candle index by close_time
         idx = None
-        for i in range(len(klines) - 1):  # ignore last open candle
-            if klines[i]["close_time"] == st.impulse_candle_time:
+        for i in range(len(klines) - 1):  # ignore open candle
+            if klines[i]["close_time"] == st.impulse_candle_close_time:
                 idx = i
                 break
 
         if idx is None:
-            st.stage = "WAIT_IMPULSE"
-            st.impulse_candle_time = 0
+            st = SymbolState()
         else:
-            # pullback candle should be the next closed candle after impulse
+            # pullback must be the next CLOSED candle after impulse
             if idx + 1 <= len(klines) - 2:
                 pb = klines[idx + 1]
-                ok_pb = (is_bearish(pb) if REQUIRE_BEARISH_PULLBACK else True)
+                ok_pb = is_bearish(pb) if REQUIRE_BEARISH_PULLBACK else True
                 if ok_pb:
                     st.pullback_high = pb["high"]
                     st.pullback_low = pb["low"]
                     st.pullback_close_time = pb["close_time"]
                     st.stage = "WAIT_BREAK_HIGH"
                 else:
-                    # impulse ketidan pullback chiqmasa reset
-                    st.stage = "WAIT_IMPULSE"
-                    st.impulse_candle_time = 0
+                    # impulse ketidan pullback yo'q -> reset
+                    st = SymbolState()
 
     elif st.stage == "WAIT_BREAK_HIGH":
+        # BUY: price breaks pullback candle HIGH
         if st.pullback_high > 0 and last_price > st.pullback_high:
             st.stage = "IN_POSITION"
             st.in_position = True
@@ -298,53 +267,53 @@ def analyze_symbol(symbol: str, st: SymbolState, klines: List[dict], last_price:
                 st.last_signal = key
                 signal = (
                     f"{symbol} ✅ BUY\n"
-                    f"Break pullback HIGH: {format_price(st.pullback_high)}\n"
+                    f"Pullback HIGH break: {format_price(st.pullback_high)}\n"
                     f"Price: {format_price(last_price)}\n"
                     f"TF: {INTERVAL}"
                 )
 
     elif st.stage == "IN_POSITION":
-        # SELL: price breaks below last closed candle LOW (faqat BUYdan keyin)
+        # SELL: after BUY, if price breaks below last closed candle LOW
         if st.last_closed_low > 0 and last_price < st.last_closed_low:
             key = sig_key("SELL", st.last_closed_time)
             if st.last_signal != key:
                 st.last_signal = key
                 signal = (
                     f"{symbol} 🟥 SELL\n"
-                    f"Break last CLOSED LOW: {format_price(st.last_closed_low)}\n"
+                    f"Last CLOSED LOW break: {format_price(st.last_closed_low)}\n"
                     f"Price: {format_price(last_price)}\n"
                     f"TF: {INTERVAL}"
                 )
-
             # reset after sell
-            st = SymbolState()  # clean reset
+            st = SymbolState()
 
     return st, signal
 
 
 # =======================
-# Background loops
+# Background scanner loop
 # =======================
 async def scanner_loop(app: Application) -> None:
     state = load_state()
-    tradable_usdt = set()
 
-    # exchangeInfo 1 marta olib qo'yamiz (ba'zida og'ir)
+    # Exchange info once
+    tradable_usdt = set()
     try:
         tradable_usdt = get_exchange_info_symbols_usdt()
     except Exception as e:
         await tg_send(app, f"⚠️ exchangeInfo error: {e}")
 
-    top10: List[str] = []
+    top10: List[str] = state.get("top10", []) or []
 
     while True:
         try:
-            # refresh top10 periodically
+            # refresh top10
             if now_ts() - int(state.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
                 top10 = get_top10_gainers_usdt(tradable_usdt)
+                state["top10"] = top10
                 state["last_top_refresh"] = now_ts()
 
-                # remove states not in top10 (to keep clean)
+                # clear states not in top10
                 for sym in list(state.get("symbols", {}).keys()):
                     if sym not in top10:
                         state["symbols"].pop(sym, None)
@@ -356,7 +325,7 @@ async def scanner_loop(app: Application) -> None:
                 st = ensure_symbol_state(state, sym)
 
                 kl = get_klines(sym, INTERVAL, KLINE_LIMIT)
-                price = get_mark_price(sym)
+                price = get_spot_price(sym)
 
                 st, sig = analyze_symbol(sym, st, kl, price)
                 update_symbol_state_dict(state, sym, st)
@@ -367,35 +336,42 @@ async def scanner_loop(app: Application) -> None:
             save_state(state)
 
         except Exception as e:
-            # don't crash loop
             await tg_send(app, f"⚠️ Scan error: {e}")
 
         await asyncio.sleep(SCAN_EVERY_SEC)
 
 
 # =======================
-# Telegram commands
+# Commands
 # =======================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "✅ Bot ishga tushdi.\n"
         f"TF: {INTERVAL}\n"
         "Qoidalar:\n"
-        "- TOP 10 gainers (24h) USDT spot\n"
-        "- Impulse (bullish %)\n"
-        "- Pullback bearish candle\n"
+        "- Binance SPOT TOP 10 gainers (24h) USDT\n"
+        "- Impulse bullish (foiz)\n"
+        "- 1 ta bearish pullback candle\n"
         "- BUY: pullback HIGH break\n"
-        "- SELL: BUYdan keyin last closed LOW break"
+        "- SELL: BUYdan keyin last closed LOW break\n\n"
+        "Buyruqlar:\n"
+        "/status"
     )
     await update.message.reply_text(txt)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st = load_state()
+    top10 = st.get("top10", [])
     syms = list(st.get("symbols", {}).keys())
-    await update.message.reply_text(f"Tracking symbols: {len(syms)}\n" + ("\n".join(syms[:10]) if syms else "—"))
+    msg = "📌 TOP10 (24h):\n" + ("\n".join(top10) if top10 else "—")
+    msg += "\n\n🧠 Active states:\n" + ("\n".join(syms) if syms else "—")
+    await update.message.reply_text(msg)
 
 
+# =======================
+# Main
+# =======================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env yo'q")
@@ -406,8 +382,11 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
-    # background scanner
-    app.job_queue.run_once(lambda *_: asyncio.create_task(scanner_loop(app)), when=1)
+    async def on_startup(app_: Application):
+        asyncio.create_task(scanner_loop(app_))
+
+    # PTB 21.x uchun to'g'ri startup hook
+    app.post_init = on_startup
 
     app.run_polling(drop_pending_updates=True)
 
