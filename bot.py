@@ -2,13 +2,11 @@ import os
 import time
 import requests
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 # =========================
 # ENV
 # =========================
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision").strip()
-
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
@@ -22,27 +20,37 @@ NEAR_PCT = float(os.getenv("NEAR_PCT", "2.0"))        # 2%
 
 REF_SYMBOL = (os.getenv("REF_SYMBOL", "BTCUSDT") or "BTCUSDT").strip().upper()
 
-# pacing (stabil)
+# pacing
 LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
 PRICE_REFRESH_SEC = float(os.getenv("PRICE_REFRESH_SEC", "10"))
 CLOSE_CHECK_SEC = float(os.getenv("CLOSE_CHECK_SEC", "120"))
 TOP_REFRESH_SEC = float(os.getenv("TOP_REFRESH_SEC", "300"))
+HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "60"))
 
-# batch for daily high loading
+# batch
 BATCH_1D = int(os.getenv("BATCH_1D", "12"))
 
-# filters (leveraged/stable)
+# filters
 BAD_PARTS = ("UPUSDT", "DOWNUSDT", "BULL", "BEAR", "3L", "3S", "5L", "5S")
 STABLE_STABLE = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT"}
 
+# Binance base fallbacks (region/451 muammosi uchun)
+BINANCE_BASES = [
+    (os.getenv("BINANCE_BASE_URL") or "").strip() or "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.0"})
+SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.2"})
 
 
 # =========================
 # TELEGRAM
 # =========================
-def tg_send(text: str):
+def tg_send(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = SESSION.post(
@@ -57,26 +65,36 @@ def tg_send(text: str):
         )
         if r.status_code != 200:
             print("[TG SEND ERROR]", r.status_code, r.text)
+            return False
+        return True
     except Exception as e:
         print("[TG SEND EXC]", e)
+        return False
 
 
 # =========================
-# BINANCE
+# BINANCE (fallback)
 # =========================
-def fetch_json(url: str, params=None):
-    r = SESSION.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
+def fetch_json(path: str, params=None):
+    last_err = None
+    for base in BINANCE_BASES:
+        try:
+            url = base.rstrip("/") + path
+            r = SESSION.get(url, params=params, timeout=25)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
 
 def fetch_klines(symbol: str, interval: str, limit: int = 2):
     return fetch_json(
-        f"{BINANCE_BASE_URL}/api/v3/klines",
+        "/api/v3/klines",
         {"symbol": symbol, "interval": interval, "limit": limit},
     )
 
 def kline_to_ohlc(k) -> Tuple[int, float, float, float, float, int]:
-    # openTime, open, high, low, close, closeTime
     return int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
 
 def last_closed_close_time(symbol: str, interval: str) -> int:
@@ -85,7 +103,7 @@ def last_closed_close_time(symbol: str, interval: str) -> int:
     return last_closed[5]
 
 def fetch_all_prices() -> Dict[str, float]:
-    arr = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/price")
+    arr = fetch_json("/api/v3/ticker/price")
     out = {}
     for x in arr:
         try:
@@ -94,14 +112,44 @@ def fetch_all_prices() -> Dict[str, float]:
             pass
     return out
 
+def remaining_pct_to_level(price: float, level: float) -> float:
+    if level <= 0:
+        return 999.0
+    return ((level - price) / level) * 100.0
+
+
+# =========================
+# SPOT filter set
+# =========================
+SPOT_USDT: Set[str] = set()
+
+def load_spot_usdt_set():
+    info = fetch_json("/api/v3/exchangeInfo")
+    ok = set()
+    for s in info.get("symbols", []):
+        sym = s.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        if s.get("status") != "TRADING":
+            continue
+        if sym in STABLE_STABLE or any(x in sym for x in BAD_PARTS):
+            continue
+        if s.get("quoteAsset") != "USDT":
+            continue
+
+        perms = s.get("permissions", [])
+        psets = s.get("permissionSets", [])
+        is_spot = ("SPOT" in perms) or any(("SPOT" in ps) for ps in psets)
+        if is_spot:
+            ok.add(sym)
+    return ok
+
 def get_top_gainers_usdt(top_n: int) -> List[str]:
-    data = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
+    data = fetch_json("/api/v3/ticker/24hr")
     items = []
     for d in data:
         sym = d.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        if sym in STABLE_STABLE or any(x in sym for x in BAD_PARTS):
+        if sym not in SPOT_USDT:
             continue
         try:
             pct = float(d.get("priceChangePercent", "0"))
@@ -111,12 +159,6 @@ def get_top_gainers_usdt(top_n: int) -> List[str]:
     items.sort(reverse=True, key=lambda x: x[0])
     return [s for _, s in items[:top_n]]
 
-def remaining_pct_to_level(price: float, level: float) -> float:
-    # 0 demak levelga yetdi yoki tepada
-    if level <= 0:
-        return 999.0
-    return ((level - price) / level) * 100.0
-
 
 # =========================
 # STATE
@@ -125,27 +167,22 @@ def remaining_pct_to_level(price: float, level: float) -> float:
 class Watch:
     level: float
     sent: bool = False
-    broken_up: bool = False   # price >= level bo'lib tepaga chiqdimi (retestda ham qayta BUY yo'q)
+    broken_up: bool = False  # price >= level bo'lib tepaga chiqdimi (retestda ham BUY yo'q)
 
 @dataclass
 class BotState:
-    # candle close tracking
     last_1m_close: Optional[int] = None
     last_1w_close: Optional[int] = None
     last_1d_close: Optional[int] = None
 
-    # armed flags (faqat YANGI close bo'lganda True bo'ladi)
     month_armed: bool = False
     week_armed: bool = False
 
-    # top50
     top_symbols: List[str] = field(default_factory=list)
     last_top_refresh_ts: float = 0.0
 
-    # daily highs watch (per coin)
     watch_1d_high: Dict[str, Watch] = field(default_factory=dict)
 
-    # loader
     need_load_1d: bool = False
     load_1d_index: int = 0
 
@@ -168,20 +205,18 @@ def refresh_top50(force: bool = False):
 # =========================
 def on_monthly_close():
     ST.month_armed = True
+    print("[ARM] monthly armed")
 
 def on_weekly_close():
     ST.week_armed = True
+    print("[ARM] weekly armed")
 
 def on_daily_close():
-    """
-    Har safar 1D yopilganda:
-    - Top50 yangilanadi
-    - 1D last closed high larni qayta yuklash (cycle)
-    """
     refresh_top50(force=True)
     ST.watch_1d_high.clear()
     ST.need_load_1d = True
     ST.load_1d_index = 0
+    print("[CYCLE] daily close -> reload 1d highs")
 
 
 # =========================
@@ -196,25 +231,29 @@ def load_batch_1d_highs():
     end = min(ST.load_1d_index + BATCH_1D, len(ST.top_symbols))
     batch = ST.top_symbols[ST.load_1d_index:end]
 
+    ok = 0
     for sym in batch:
         try:
             kl = fetch_klines(sym, "1d", 2)
             last_closed = kline_to_ohlc(kl[-2])
             _, _, high, _, _, _ = last_closed
             ST.watch_1d_high[sym] = Watch(level=high)
+            ok += 1
         except Exception:
             pass
 
     ST.load_1d_index = end
+    print(f"[LOAD] 1d highs batch {ST.load_1d_index}/{len(ST.top_symbols)} ok={ok}")
+
     if ST.load_1d_index >= len(ST.top_symbols):
         ST.need_load_1d = False
+        print("[LOAD] 1d highs done")
 
 
 # =========================
 # SIGNALS
 # =========================
 def check_signals(prices: Dict[str, float]):
-    # faqat 1M + 1W yopilgandan keyin ishlasin
     if not (ST.month_armed and ST.week_armed):
         return
 
@@ -223,7 +262,6 @@ def check_signals(prices: Dict[str, float]):
         if price is None:
             continue
 
-        # tepaga yorib o'tsa -> endi retestda ham signal yo'q
         if price >= w.level:
             w.broken_up = True
             continue
@@ -245,23 +283,32 @@ def check_signals(prices: Dict[str, float]):
 # MAIN
 # =========================
 def main():
-    tg_send("✅ Top50: 1M+1W armed -> 1D high'ga 2% qolganda BUY bot start.")
+    global SPOT_USDT
 
-    # initial top
+    print("[BOOT] loading SPOT universe...")
+    SPOT_USDT = load_spot_usdt_set()
+    print(f"[BOOT] spot_usdt={len(SPOT_USDT)}")
+
+    ok = tg_send("✅ Top50: 1M+1W armed -> 1D high'ga 2% qolganda BUY bot start.")
+    print("[BOOT] telegram start msg:", ok)
+
     refresh_top50(force=True)
 
     last_prices_ts = 0.0
     last_close_ts = 0.0
+    last_hb = 0.0
     backoff = 1.0
 
     while True:
         try:
             now = time.time()
 
-            # refresh top list
+            if now - last_hb >= HEARTBEAT_SEC:
+                last_hb = now
+                print(f"[HB] alive | armed={ST.month_armed and ST.week_armed} | top={len(ST.top_symbols)} | watch={len(ST.watch_1d_high)}")
+
             refresh_top50(force=False)
 
-            # close checks (1M/1W/1D)
             if (now - last_close_ts) >= CLOSE_CHECK_SEC:
                 last_close_ts = now
 
@@ -287,10 +334,8 @@ def main():
                     ST.last_1d_close = cur_1d
                     on_daily_close()
 
-            # batch load daily highs
             load_batch_1d_highs()
 
-            # price snapshot + signals
             if (now - last_prices_ts) >= PRICE_REFRESH_SEC:
                 last_prices_ts = now
                 prices = fetch_all_prices()
