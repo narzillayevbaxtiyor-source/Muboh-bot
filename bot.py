@@ -1,394 +1,309 @@
 import os
-import json
 import time
-import asyncio
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
-
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-
-# =======================
+# =========================
 # ENV
-# =======================
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-CHAT_ID = int((os.getenv("CHAT_ID") or "0").strip() or "0")
+# =========================
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision").strip()
 
-# =======================
-# SETTINGS
-# =======================
-INTERVAL = os.getenv("INTERVAL", "3m")
-SCAN_EVERY_SEC = int(os.getenv("SCAN_EVERY_SEC", "10"))          # signal tezligi
-TOP_REFRESH_SEC = int(os.getenv("TOP_REFRESH_SEC", "180"))       # top10 yangilash
-KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "80"))
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-# Impulse: (close-open)/open >= IMPULSE_PCT
-IMPULSE_PCT = float(os.getenv("IMPULSE_PCT", "0.004"))  # 0.40% default (3m uchun)
-REQUIRE_BEARISH_PULLBACK = (os.getenv("REQUIRE_BEARISH_PULLBACK", "1").strip() != "0")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN env yo'q")
+if not TELEGRAM_CHAT_ID:
+    raise RuntimeError("TELEGRAM_CHAT_ID env yo'q")
 
-STATE_FILE = os.getenv("STATE_FILE", "state.json")
+TOP_N = int(os.getenv("TOP_N", "50"))                 # Top 50
+NEAR_PCT = float(os.getenv("NEAR_PCT", "2.0"))        # 2%
 
-# Binance API fallback (restricted location bo'lsa ham ko'p joyda ishlaydi)
-BINANCE_BASES = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision",
-]
+REF_SYMBOL = (os.getenv("REF_SYMBOL", "BTCUSDT") or "BTCUSDT").strip().upper()
 
+# pacing (stabil)
+LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
+PRICE_REFRESH_SEC = float(os.getenv("PRICE_REFRESH_SEC", "10"))
+CLOSE_CHECK_SEC = float(os.getenv("CLOSE_CHECK_SEC", "120"))
+TOP_REFRESH_SEC = float(os.getenv("TOP_REFRESH_SEC", "300"))
 
-# =======================
-# Helpers
-# =======================
-def now_ts() -> int:
-    return int(time.time())
+# batch for daily high loading
+BATCH_1D = int(os.getenv("BATCH_1D", "12"))
+
+# filters (leveraged/stable)
+BAD_PARTS = ("UPUSDT", "DOWNUSDT", "BULL", "BEAR", "3L", "3S", "5L", "5S")
+STABLE_STABLE = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT"}
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.0"})
 
 
-def safe_float(x) -> float:
+# =========================
+# TELEGRAM
+# =========================
+def tg_send(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        return float(x)
-    except Exception:
-        return 0.0
+        r = SESSION.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=25,
+        )
+        if r.status_code != 200:
+            print("[TG SEND ERROR]", r.status_code, r.text)
+    except Exception as e:
+        print("[TG SEND EXC]", e)
 
 
-def http_get_json(path: str, params: Optional[dict] = None, timeout: int = 10):
-    last_err = None
-    for base in BINANCE_BASES:
-        url = base + path
+# =========================
+# BINANCE
+# =========================
+def fetch_json(url: str, params=None):
+    r = SESSION.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_klines(symbol: str, interval: str, limit: int = 2):
+    return fetch_json(
+        f"{BINANCE_BASE_URL}/api/v3/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit},
+    )
+
+def kline_to_ohlc(k) -> Tuple[int, float, float, float, float, int]:
+    # openTime, open, high, low, close, closeTime
+    return int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
+
+def last_closed_close_time(symbol: str, interval: str) -> int:
+    kl = fetch_klines(symbol, interval, 2)
+    last_closed = kline_to_ohlc(kl[-2])
+    return last_closed[5]
+
+def fetch_all_prices() -> Dict[str, float]:
+    arr = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/price")
+    out = {}
+    for x in arr:
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"All Binance endpoints failed: {path}. Last error: {last_err}")
-
-
-def load_state() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {"symbols": {}, "last_top_refresh": 0, "top10": []}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"symbols": {}, "last_top_refresh": 0, "top10": []}
-
-
-def save_state(state: dict) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
-
-
-def format_price(p: float) -> str:
-    if p >= 1:
-        return f"{p:.6f}".rstrip("0").rstrip(".")
-    return f"{p:.10f}".rstrip("0").rstrip(".")
-
-
-def parse_klines(klines: list) -> List[dict]:
-    out = []
-    for k in klines:
-        out.append({
-            "open_time": int(k[0]),
-            "open": safe_float(k[1]),
-            "high": safe_float(k[2]),
-            "low": safe_float(k[3]),
-            "close": safe_float(k[4]),
-            "close_time": int(k[6]),
-        })
+            out[x["symbol"]] = float(x["price"])
+        except:
+            pass
     return out
 
-
-def is_bull_impulse(c: dict) -> bool:
-    if c["open"] <= 0:
-        return False
-    bullish = c["close"] > c["open"]
-    pct = (c["close"] - c["open"]) / c["open"]
-    return bullish and pct >= IMPULSE_PCT
-
-
-def is_bearish(c: dict) -> bool:
-    return c["close"] < c["open"]
-
-
-# =======================
-# Binance data
-# =======================
-def get_exchange_info_symbols_usdt() -> set:
-    data = http_get_json("/api/v3/exchangeInfo")
-    ok = set()
-    for s in data.get("symbols", []):
-        if s.get("status") != "TRADING":
+def get_top_gainers_usdt(top_n: int) -> List[str]:
+    data = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
+    items = []
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"):
             continue
-        sym = s.get("symbol", "")
-        if sym.endswith("USDT"):
-            ok.add(sym)
-    return ok
-
-
-def get_top10_gainers_usdt(tradable_usdt: set) -> List[str]:
-    tickers = http_get_json("/api/v3/ticker/24hr")
-    rows = []
-    for t in tickers:
-        sym = t.get("symbol", "")
-        if sym not in tradable_usdt:
+        if sym in STABLE_STABLE or any(x in sym for x in BAD_PARTS):
             continue
-        if sym.endswith(("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+        try:
+            pct = float(d.get("priceChangePercent", "0"))
+        except:
             continue
-        p = safe_float(t.get("priceChangePercent", 0))
-        rows.append((sym, p))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in rows[:10]]
+        items.append((pct, sym))
+    items.sort(reverse=True, key=lambda x: x[0])
+    return [s for _, s in items[:top_n]]
+
+def remaining_pct_to_level(price: float, level: float) -> float:
+    # 0 demak levelga yetdi yoki tepada
+    if level <= 0:
+        return 999.0
+    return ((level - price) / level) * 100.0
 
 
-def get_klines(symbol: str, interval: str, limit: int) -> List[dict]:
-    data = http_get_json("/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-    return parse_klines(data)
-
-
-def get_spot_price(symbol: str) -> float:
-    data = http_get_json("/api/v3/ticker/price", params={"symbol": symbol})
-    return safe_float(data.get("price", 0))
-
-
-# =======================
-# Telegram send
-# =======================
-async def tg_send(app: Application, text: str) -> None:
-    try:
-        await app.bot.send_message(chat_id=CHAT_ID, text=text)
-    except Exception:
-        pass
-
-
-# =======================
-# State per symbol
-# =======================
+# =========================
+# STATE
+# =========================
 @dataclass
-class SymbolState:
-    stage: str = "WAIT_IMPULSE"   # WAIT_IMPULSE -> WAIT_PULLBACK -> WAIT_BREAK_HIGH -> IN_POSITION
-    impulse_candle_close_time: int = 0
+class Watch:
+    level: float
+    sent: bool = False
+    broken_up: bool = False   # price >= level bo'lib tepaga chiqdimi (retestda ham qayta BUY yo'q)
 
-    pullback_high: float = 0.0
-    pullback_low: float = 0.0
-    pullback_close_time: int = 0
+@dataclass
+class BotState:
+    # candle close tracking
+    last_1m_close: Optional[int] = None
+    last_1w_close: Optional[int] = None
+    last_1d_close: Optional[int] = None
 
-    in_position: bool = False
-    buy_price: float = 0.0
-    buy_time: int = 0
+    # armed flags (faqat YANGI close bo'lganda True bo'ladi)
+    month_armed: bool = False
+    week_armed: bool = False
 
-    last_closed_time: int = 0
-    last_closed_low: float = 0.0
+    # top50
+    top_symbols: List[str] = field(default_factory=list)
+    last_top_refresh_ts: float = 0.0
 
-    last_signal: str = ""
+    # daily highs watch (per coin)
+    watch_1d_high: Dict[str, Watch] = field(default_factory=dict)
 
+    # loader
+    need_load_1d: bool = False
+    load_1d_index: int = 0
 
-def ensure_symbol_state(state: dict, symbol: str) -> SymbolState:
-    s = state["symbols"].get(symbol)
-    if not s:
-        st = SymbolState()
-        state["symbols"][symbol] = asdict(st)
-        return st
-    # merge defaults safely
-    st = SymbolState(**{**asdict(SymbolState()), **s})
-    state["symbols"][symbol] = asdict(st)
-    return st
-
-
-def update_symbol_state_dict(state: dict, symbol: str, st: SymbolState) -> None:
-    state["symbols"][symbol] = asdict(st)
+ST = BotState()
 
 
-# =======================
-# Trading logic
-# =======================
-def analyze_symbol(symbol: str, st: SymbolState, klines: List[dict], last_price: float) -> Tuple[SymbolState, Optional[str]]:
-    if len(klines) < 5:
-        return st, None
-
-    # -1 is current open candle, -2 is last closed candle
-    last_closed = klines[-2]
-
-    # Track last closed low (used for SELL)
-    if last_closed["close_time"] != st.last_closed_time:
-        st.last_closed_time = last_closed["close_time"]
-        st.last_closed_low = last_closed["low"]
-
-    signal = None
-
-    def sig_key(kind: str, t: int) -> str:
-        return f"{kind}:{t}"
-
-    if st.stage == "WAIT_IMPULSE":
-        if is_bull_impulse(last_closed):
-            st.stage = "WAIT_PULLBACK"
-            st.impulse_candle_close_time = last_closed["close_time"]
-
-    elif st.stage == "WAIT_PULLBACK":
-        # find impulse candle index by close_time
-        idx = None
-        for i in range(len(klines) - 1):  # ignore open candle
-            if klines[i]["close_time"] == st.impulse_candle_close_time:
-                idx = i
-                break
-
-        if idx is None:
-            st = SymbolState()
-        else:
-            # pullback must be the next CLOSED candle after impulse
-            if idx + 1 <= len(klines) - 2:
-                pb = klines[idx + 1]
-                ok_pb = is_bearish(pb) if REQUIRE_BEARISH_PULLBACK else True
-                if ok_pb:
-                    st.pullback_high = pb["high"]
-                    st.pullback_low = pb["low"]
-                    st.pullback_close_time = pb["close_time"]
-                    st.stage = "WAIT_BREAK_HIGH"
-                else:
-                    # impulse ketidan pullback yo'q -> reset
-                    st = SymbolState()
-
-    elif st.stage == "WAIT_BREAK_HIGH":
-        # BUY: price breaks pullback candle HIGH
-        if st.pullback_high > 0 and last_price > st.pullback_high:
-            st.stage = "IN_POSITION"
-            st.in_position = True
-            st.buy_time = now_ts()
-            st.buy_price = last_price
-
-            key = sig_key("BUY", st.pullback_close_time)
-            if st.last_signal != key:
-                st.last_signal = key
-                signal = (
-                    f"{symbol} ✅ BUY\n"
-                    f"Pullback HIGH break: {format_price(st.pullback_high)}\n"
-                    f"Price: {format_price(last_price)}\n"
-                    f"TF: {INTERVAL}"
-                )
-
-    elif st.stage == "IN_POSITION":
-        # SELL: after BUY, if price breaks below last closed candle LOW
-        if st.last_closed_low > 0 and last_price < st.last_closed_low:
-            key = sig_key("SELL", st.last_closed_time)
-            if st.last_signal != key:
-                st.last_signal = key
-                signal = (
-                    f"{symbol} 🟥 SELL\n"
-                    f"Last CLOSED LOW break: {format_price(st.last_closed_low)}\n"
-                    f"Price: {format_price(last_price)}\n"
-                    f"TF: {INTERVAL}"
-                )
-            # reset after sell
-            st = SymbolState()
-
-    return st, signal
+# =========================
+# TOP50 refresh
+# =========================
+def refresh_top50(force: bool = False):
+    now = time.time()
+    if (not force) and ST.top_symbols and (now - ST.last_top_refresh_ts) < TOP_REFRESH_SEC:
+        return
+    ST.top_symbols = get_top_gainers_usdt(TOP_N)
+    ST.last_top_refresh_ts = now
 
 
-# =======================
-# Background scanner loop
-# =======================
-async def scanner_loop(app: Application) -> None:
-    state = load_state()
+# =========================
+# EVENTS
+# =========================
+def on_monthly_close():
+    ST.month_armed = True
 
-    # Exchange info once
-    tradable_usdt = set()
-    try:
-        tradable_usdt = get_exchange_info_symbols_usdt()
-    except Exception as e:
-        await tg_send(app, f"⚠️ exchangeInfo error: {e}")
+def on_weekly_close():
+    ST.week_armed = True
 
-    top10: List[str] = state.get("top10", []) or []
+def on_daily_close():
+    """
+    Har safar 1D yopilganda:
+    - Top50 yangilanadi
+    - 1D last closed high larni qayta yuklash (cycle)
+    """
+    refresh_top50(force=True)
+    ST.watch_1d_high.clear()
+    ST.need_load_1d = True
+    ST.load_1d_index = 0
+
+
+# =========================
+# LOAD daily highs (batch)
+# =========================
+def load_batch_1d_highs():
+    if not ST.need_load_1d:
+        return
+    if not ST.top_symbols:
+        return
+
+    end = min(ST.load_1d_index + BATCH_1D, len(ST.top_symbols))
+    batch = ST.top_symbols[ST.load_1d_index:end]
+
+    for sym in batch:
+        try:
+            kl = fetch_klines(sym, "1d", 2)
+            last_closed = kline_to_ohlc(kl[-2])
+            _, _, high, _, _, _ = last_closed
+            ST.watch_1d_high[sym] = Watch(level=high)
+        except Exception:
+            pass
+
+    ST.load_1d_index = end
+    if ST.load_1d_index >= len(ST.top_symbols):
+        ST.need_load_1d = False
+
+
+# =========================
+# SIGNALS
+# =========================
+def check_signals(prices: Dict[str, float]):
+    # faqat 1M + 1W yopilgandan keyin ishlasin
+    if not (ST.month_armed and ST.week_armed):
+        return
+
+    for sym, w in ST.watch_1d_high.items():
+        price = prices.get(sym)
+        if price is None:
+            continue
+
+        # tepaga yorib o'tsa -> endi retestda ham signal yo'q
+        if price >= w.level:
+            w.broken_up = True
+            continue
+
+        if w.sent or w.broken_up:
+            continue
+
+        rem = remaining_pct_to_level(price, w.level)
+        if 0.0 <= rem <= NEAR_PCT:
+            w.sent = True
+            tg_send(
+                f"📈 <b>BUY</b> <b>{sym}</b>\n"
+                f"<b>1d high near</b> ({NEAR_PCT:.2f}%)\n"
+                f"Qolgan: <b>{rem:.4f}%</b>"
+            )
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    tg_send("✅ Top50: 1M+1W armed -> 1D high'ga 2% qolganda BUY bot start.")
+
+    # initial top
+    refresh_top50(force=True)
+
+    last_prices_ts = 0.0
+    last_close_ts = 0.0
+    backoff = 1.0
 
     while True:
         try:
-            # refresh top10
-            if now_ts() - int(state.get("last_top_refresh", 0)) >= TOP_REFRESH_SEC or not top10:
-                top10 = get_top10_gainers_usdt(tradable_usdt)
-                state["top10"] = top10
-                state["last_top_refresh"] = now_ts()
+            now = time.time()
 
-                # clear states not in top10
-                for sym in list(state.get("symbols", {}).keys()):
-                    if sym not in top10:
-                        state["symbols"].pop(sym, None)
+            # refresh top list
+            refresh_top50(force=False)
 
-                save_state(state)
+            # close checks (1M/1W/1D)
+            if (now - last_close_ts) >= CLOSE_CHECK_SEC:
+                last_close_ts = now
 
-            # scan each symbol
-            for sym in top10:
-                st = ensure_symbol_state(state, sym)
+                cur_1m = last_closed_close_time(REF_SYMBOL, "1M")
+                if ST.last_1m_close is None:
+                    ST.last_1m_close = cur_1m
+                elif cur_1m != ST.last_1m_close:
+                    ST.last_1m_close = cur_1m
+                    on_monthly_close()
 
-                kl = get_klines(sym, INTERVAL, KLINE_LIMIT)
-                price = get_spot_price(sym)
+                cur_1w = last_closed_close_time(REF_SYMBOL, "1w")
+                if ST.last_1w_close is None:
+                    ST.last_1w_close = cur_1w
+                elif cur_1w != ST.last_1w_close:
+                    ST.last_1w_close = cur_1w
+                    on_weekly_close()
 
-                st, sig = analyze_symbol(sym, st, kl, price)
-                update_symbol_state_dict(state, sym, st)
+                cur_1d = last_closed_close_time(REF_SYMBOL, "1d")
+                if ST.last_1d_close is None:
+                    ST.last_1d_close = cur_1d
+                    on_daily_close()
+                elif cur_1d != ST.last_1d_close:
+                    ST.last_1d_close = cur_1d
+                    on_daily_close()
 
-                if sig:
-                    await tg_send(app, sig)
+            # batch load daily highs
+            load_batch_1d_highs()
 
-            save_state(state)
+            # price snapshot + signals
+            if (now - last_prices_ts) >= PRICE_REFRESH_SEC:
+                last_prices_ts = now
+                prices = fetch_all_prices()
+                check_signals(prices)
+
+            backoff = 1.0
 
         except Exception as e:
-            await tg_send(app, f"⚠️ Scan error: {e}")
+            print("[ERROR]", e)
+            time.sleep(min(60.0, backoff))
+            backoff *= 2.0
 
-        await asyncio.sleep(SCAN_EVERY_SEC)
-
-
-# =======================
-# Commands
-# =======================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "✅ Bot ishga tushdi.\n"
-        f"TF: {INTERVAL}\n"
-        "Qoidalar:\n"
-        "- Binance SPOT TOP 10 gainers (24h) USDT\n"
-        "- Impulse bullish (foiz)\n"
-        "- 1 ta bearish pullback candle\n"
-        "- BUY: pullback HIGH break\n"
-        "- SELL: BUYdan keyin last closed LOW break\n\n"
-        "Buyruqlar:\n"
-        "/status"
-    )
-    await update.message.reply_text(txt)
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    st = load_state()
-    top10 = st.get("top10", [])
-    syms = list(st.get("symbols", {}).keys())
-    msg = "📌 TOP10 (24h):\n" + ("\n".join(top10) if top10 else "—")
-    msg += "\n\n🧠 Active states:\n" + ("\n".join(syms) if syms else "—")
-    await update.message.reply_text(msg)
-
-
-# =======================
-# Main
-# =======================
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN env yo'q")
-    if CHAT_ID == 0:
-        raise RuntimeError("CHAT_ID env yo'q")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-
-    async def on_startup(app_: Application):
-        asyncio.create_task(scanner_loop(app_))
-
-    # PTB 21.x uchun to'g'ri startup hook
-    app.post_init = on_startup
-
-    app.run_polling(drop_pending_updates=True)
+        time.sleep(LOOP_SLEEP_SEC)
 
 
 if __name__ == "__main__":
