@@ -44,7 +44,7 @@ BINANCE_BASES = [
 ]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.2"})
+SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.3"})
 
 
 # =========================
@@ -95,6 +95,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 2):
     )
 
 def kline_to_ohlc(k) -> Tuple[int, float, float, float, float, int]:
+    # openTime, open, high, low, close, closeTime
     return int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
 
 def last_closed_close_time(symbol: str, interval: str) -> int:
@@ -113,6 +114,7 @@ def fetch_all_prices() -> Dict[str, float]:
     return out
 
 def remaining_pct_to_level(price: float, level: float) -> float:
+    # 0 demak levelga yetdi yoki tepada
     if level <= 0:
         return 999.0
     return ((level - price) / level) * 100.0
@@ -212,6 +214,7 @@ def on_weekly_close():
     print("[ARM] weekly armed")
 
 def on_daily_close():
+    # Har safar 1D yopilganda: Top50 yangilanadi va 1D high lar qayta yuklanadi
     refresh_top50(force=True)
     ST.watch_1d_high.clear()
     ST.need_load_1d = True
@@ -254,6 +257,7 @@ def load_batch_1d_highs():
 # SIGNALS
 # =========================
 def check_signals(prices: Dict[str, float]):
+    # faqat 1M + 1W armed bo'lsa ishlasin
     if not (ST.month_armed and ST.week_armed):
         return
 
@@ -262,6 +266,7 @@ def check_signals(prices: Dict[str, float]):
         if price is None:
             continue
 
+        # tepaga yorib o'tsa -> retestda ham signal yo'q
         if price >= w.level:
             w.broken_up = True
             continue
@@ -292,7 +297,26 @@ def main():
     ok = tg_send("✅ Top50: 1M+1W armed -> 1D high'ga 2% qolganda BUY bot start.")
     print("[BOOT] telegram start msg:", ok)
 
+    # initial top + initial daily highs (hoziroq ishga tushsin)
     refresh_top50(force=True)
+
+    # ---- STARTDA ARM QILIB OLISH (kutib o'tirmaslik uchun) ----
+    try:
+        ST.last_1m_close = last_closed_close_time(REF_SYMBOL, "1M")
+        ST.last_1w_close = last_closed_close_time(REF_SYMBOL, "1w")
+        ST.month_armed = True
+        ST.week_armed = True
+        print("[ARM] boot armed=True (1M+1W)")
+    except Exception as e:
+        print("[ARM] boot arm failed:", e)
+    # ----------------------------------------------------------
+
+    # startdayoq 1D cycle ni ishga tushirib, high larni yuklab olamiz
+    try:
+        ST.last_1d_close = last_closed_close_time(REF_SYMBOL, "1d")
+        on_daily_close()
+    except Exception as e:
+        print("[BOOT] initial daily load failed:", e)
 
     last_prices_ts = 0.0
     last_close_ts = 0.0
@@ -309,6 +333,7 @@ def main():
 
             refresh_top50(force=False)
 
+            # close checks (1M/1W/1D) — keyingi cycle lar uchun
             if (now - last_close_ts) >= CLOSE_CHECK_SEC:
                 last_close_ts = now
 
