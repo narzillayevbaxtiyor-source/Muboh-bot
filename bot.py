@@ -1,380 +1,422 @@
 import os
 import time
-import requests
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+import json
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Tuple
 
-# =========================
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ======================
 # ENV
-# =========================
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+# ======================
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN env yo'q")
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("TELEGRAM_CHAT_ID env yo'q")
+TOP_N = int(os.getenv("TOP_N") or "50")
 
-TOP_N = int(os.getenv("TOP_N", "50"))                 # Top 50
-NEAR_PCT = float(os.getenv("NEAR_PCT", "2.0"))        # 2%
+REFRESH_TOP_SEC = float(os.getenv("REFRESH_TOP_SEC") or "120")
+REFRESH_KLINES_SEC = float(os.getenv("REFRESH_KLINES_SEC") or "90")
+SCAN_PRICE_SEC = float(os.getenv("SCAN_PRICE_SEC") or "3")
 
-REF_SYMBOL = (os.getenv("REF_SYMBOL", "BTCUSDT") or "BTCUSDT").strip().upper()
+BINANCE_BASE = (os.getenv("BINANCE_BASE") or "https://data-api.binance.vision").strip()
 
-# pacing
-LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "2"))
-PRICE_REFRESH_SEC = float(os.getenv("PRICE_REFRESH_SEC", "10"))
-CLOSE_CHECK_SEC = float(os.getenv("CLOSE_CHECK_SEC", "120"))
-TOP_REFRESH_SEC = float(os.getenv("TOP_REFRESH_SEC", "300"))
-HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "60"))
+# 1D bullish yaqinlashish: close cloud_top'dan qancha past bo'lsa "near"
+NEAR_D_PCT = float(os.getenv("NEAR_D_PCT") or "0.015")  # 1.5%
 
-# batch
-BATCH_1D = int(os.getenv("BATCH_1D", "12"))
+STATE_FILE = os.getenv("STATE_FILE") or "state_ichimoku.json"
 
-# filters
-BAD_PARTS = ("UPUSDT", "DOWNUSDT", "BULL", "BEAR", "3L", "3S", "5L", "5S")
-STABLE_STABLE = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT"}
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID yo'q")
 
-# Binance base fallbacks (region/451 muammosi uchun)
-BINANCE_BASES = [
-    (os.getenv("BINANCE_BASE_URL") or "").strip() or "https://data-api.binance.vision",
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-]
+# ======================
+# DATA
+# ======================
+@dataclass
+class Candle:
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: int
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "top50-1m1w-armed-1d-high-near/1.3"})
+def now_ms() -> int:
+    return int(time.time() * 1000)
 
-
-# =========================
-# TELEGRAM
-# =========================
-def tg_send(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = SESSION.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
-            timeout=25,
-        )
-        if r.status_code != 200:
-            print("[TG SEND ERROR]", r.status_code, r.text)
-            return False
-        return True
-    except Exception as e:
-        print("[TG SEND EXC]", e)
-        return False
-
-
-# =========================
-# BINANCE (fallback)
-# =========================
-def fetch_json(path: str, params=None):
-    last_err = None
-    for base in BINANCE_BASES:
-        try:
-            url = base.rstrip("/") + path
-            r = SESSION.get(url, params=params, timeout=25)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err
-
-def fetch_klines(symbol: str, interval: str, limit: int = 2):
-    return fetch_json(
-        "/api/v3/klines",
-        {"symbol": symbol, "interval": interval, "limit": limit},
-    )
-
-def kline_to_ohlc(k) -> Tuple[int, float, float, float, float, int]:
-    # openTime, open, high, low, close, closeTime
-    return int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), int(k[6])
-
-def last_closed_close_time(symbol: str, interval: str) -> int:
-    kl = fetch_klines(symbol, interval, 2)
-    last_closed = kline_to_ohlc(kl[-2])
-    return last_closed[5]
-
-def fetch_all_prices() -> Dict[str, float]:
-    arr = fetch_json("/api/v3/ticker/price")
-    out = {}
-    for x in arr:
-        try:
-            out[x["symbol"]] = float(x["price"])
-        except:
-            pass
-    return out
-
-def remaining_pct_to_level(price: float, level: float) -> float:
-    # 0 demak levelga yetdi yoki tepada
-    if level <= 0:
-        return 999.0
-    return ((level - price) / level) * 100.0
-
-
-# =========================
-# SPOT filter set
-# =========================
-SPOT_USDT: Set[str] = set()
-
-def load_spot_usdt_set():
-    info = fetch_json("/api/v3/exchangeInfo")
-    ok = set()
-    for s in info.get("symbols", []):
-        sym = s.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        if s.get("status") != "TRADING":
-            continue
-        if sym in STABLE_STABLE or any(x in sym for x in BAD_PARTS):
-            continue
-        if s.get("quoteAsset") != "USDT":
-            continue
-
-        perms = s.get("permissions", [])
-        psets = s.get("permissionSets", [])
-        is_spot = ("SPOT" in perms) or any(("SPOT" in ps) for ps in psets)
-        if is_spot:
-            ok.add(sym)
-    return ok
-
-def get_top_gainers_usdt(top_n: int) -> List[str]:
-    data = fetch_json("/api/v3/ticker/24hr")
-    items = []
-    for d in data:
-        sym = d.get("symbol", "")
-        if sym not in SPOT_USDT:
-            continue
-        try:
-            pct = float(d.get("priceChangePercent", "0"))
-        except:
-            continue
-        items.append((pct, sym))
-    items.sort(reverse=True, key=lambda x: x[0])
-    return [s for _, s in items[:top_n]]
-
-
-# =========================
+# ======================
 # STATE
-# =========================
-@dataclass
-class Watch:
-    level: float
-    sent: bool = False
-    broken_up: bool = False  # price >= level bo'lib tepaga chiqdimi (retestda ham BUY yo'q)
-
-@dataclass
-class BotState:
-    last_1m_close: Optional[int] = None
-    last_1w_close: Optional[int] = None
-    last_1d_close: Optional[int] = None
-
-    month_armed: bool = False
-    week_armed: bool = False
-
-    top_symbols: List[str] = field(default_factory=list)
-    last_top_refresh_ts: float = 0.0
-
-    watch_1d_high: Dict[str, Watch] = field(default_factory=dict)
-
-    need_load_1d: bool = False
-    load_1d_index: int = 0
-
-ST = BotState()
-
-
-# =========================
-# TOP50 refresh
-# =========================
-def refresh_top50(force: bool = False):
-    now = time.time()
-    if (not force) and ST.top_symbols and (now - ST.last_top_refresh_ts) < TOP_REFRESH_SEC:
-        return
-    ST.top_symbols = get_top_gainers_usdt(TOP_N)
-    ST.last_top_refresh_ts = now
-
-
-# =========================
-# EVENTS
-# =========================
-def on_monthly_close():
-    ST.month_armed = True
-    print("[ARM] monthly armed")
-
-def on_weekly_close():
-    ST.week_armed = True
-    print("[ARM] weekly armed")
-
-def on_daily_close():
-    # Har safar 1D yopilganda: Top50 yangilanadi va 1D high lar qayta yuklanadi
-    refresh_top50(force=True)
-    ST.watch_1d_high.clear()
-    ST.need_load_1d = True
-    ST.load_1d_index = 0
-    print("[CYCLE] daily close -> reload 1d highs")
-
-
-# =========================
-# LOAD daily highs (batch)
-# =========================
-def load_batch_1d_highs():
-    if not ST.need_load_1d:
-        return
-    if not ST.top_symbols:
-        return
-
-    end = min(ST.load_1d_index + BATCH_1D, len(ST.top_symbols))
-    batch = ST.top_symbols[ST.load_1d_index:end]
-
-    ok = 0
-    for sym in batch:
+# ======================
+def load_state() -> Dict[str, Any]:
+    if os.path.exists(STATE_FILE):
         try:
-            kl = fetch_klines(sym, "1d", 2)
-            last_closed = kline_to_ohlc(kl[-2])
-            _, _, high, _, _, _ = last_closed
-            ST.watch_1d_high[sym] = Watch(level=high)
-            ok += 1
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
+    return {"symbols": {}, "top_symbols": [], "last_top_refresh_ms": 0}
 
-    ST.load_1d_index = end
-    print(f"[LOAD] 1d highs batch {ST.load_1d_index}/{len(ST.top_symbols)} ok={ok}")
+def save_state(st: Dict[str, Any]) -> None:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
 
-    if ST.load_1d_index >= len(ST.top_symbols):
-        ST.need_load_1d = False
-        print("[LOAD] 1d highs done")
+def sym_state(st: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    s = st["symbols"].get(symbol)
+    if not s:
+        s = {
+            # cached last closed candle open_time for each TF
+            "last_1d_closed_open": None,
+            "last_4h_closed_open": None,
+            "last_15m_closed_open": None,
 
+            # stages
+            "armed_1d": None,          # 1D ARM event id
+            "buy_done_4h": None,       # 4H BUY event id
+            "sell_done_15m": None,     # 15m SELL event id
 
-# =========================
-# SIGNALS
-# =========================
-def check_signals(prices: Dict[str, float]):
-    # faqat 1M + 1W armed bo'lsa ishlasin
-    if not (ST.month_armed and ST.week_armed):
+            # position state
+            "in_position": False,
+
+            # for spam control (per setup cycle)
+            "setup_id": None,          # string id for current setup cycle (based on 1D closed candle)
+        }
+        st["symbols"][symbol] = s
+    return s
+
+# ======================
+# HTTP / TG
+# ======================
+async def http_get_json(session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        r.raise_for_status()
+        return await r.json()
+
+async def tg_send_text(session: aiohttp.ClientSession, text: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=20)) as r:
+        await r.text()
+
+# ======================
+# BINANCE
+# ======================
+async def get_top_gainers(session: aiohttp.ClientSession, top_n: int) -> List[str]:
+    url = f"{BINANCE_BASE}/api/v3/ticker/24hr"
+    data = await http_get_json(session, url)
+
+    usdt = []
+    for x in data:
+        sym = x.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        if sym.endswith("BUSDUSDT") or sym.endswith("USDCUSDT"):
+            continue
+        if "UPUSDT" in sym or "DOWNUSDT" in sym or "BULLUSDT" in sym or "BEARUSDT" in sym:
+            continue
+        try:
+            pct = float(x.get("priceChangePercent", "0") or "0")
+        except Exception:
+            continue
+        usdt.append((sym, pct))
+
+    usdt.sort(key=lambda t: t[1], reverse=True)
+    return [s for s, _ in usdt[:top_n]]
+
+async def get_klines(session: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[Candle]:
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    raw = await http_get_json(session, url, params={"symbol": symbol, "interval": interval, "limit": str(limit)})
+    out: List[Candle] = []
+    for k in raw:
+        out.append(Candle(
+            open_time=int(k[0]),
+            open=float(k[1]),
+            high=float(k[2]),
+            low=float(k[3]),
+            close=float(k[4]),
+            volume=float(k[5]),
+            close_time=int(k[6]),
+        ))
+    return out
+
+async def get_price_map(session: aiohttp.ClientSession, symbols: List[str]) -> Dict[str, float]:
+    url = f"{BINANCE_BASE}/api/v3/ticker/price"
+    data = await http_get_json(session, url)
+    wanted = set(symbols)
+    mp: Dict[str, float] = {}
+    for x in data:
+        sym = x.get("symbol")
+        if sym in wanted:
+            mp[sym] = float(x["price"])
+    return mp
+
+def last_closed(candles: List[Candle]) -> Candle:
+    if len(candles) < 2:
+        raise ValueError("Not enough candles")
+    return candles[-2]
+
+# ======================
+# ICHIMOKU
+# ======================
+def midpoint(highs: List[float], lows: List[float]) -> float:
+    return (max(highs) + min(lows)) / 2.0
+
+def ichimoku_lines(closed: List[Candle]) -> Optional[Dict[str, Any]]:
+    """
+    closed: ONLY closed candles (forming removed)
+    returns dict with:
+      tenkan, kijun, senkou_a, senkou_b (current computed from past),
+      cloud_top, cloud_bottom,
+      chikou_ok (lagging confirmation, optional)
+    """
+    # need at least 52 + 26 + a bit
+    if len(closed) < 80:
+        return None
+
+    highs = [c.high for c in closed]
+    lows  = [c.low  for c in closed]
+    closes = [c.close for c in closed]
+
+    # Tenkan (9)
+    tenkan = midpoint(highs[-9:], lows[-9:])
+    # Kijun (26)
+    kijun = midpoint(highs[-26:], lows[-26:])
+
+    # Senkou A = (Tenkan + Kijun)/2 shifted +26
+    senkou_a = (tenkan + kijun) / 2.0
+
+    # Senkou B = midpoint(52) shifted +26
+    senkou_b = midpoint(highs[-52:], lows[-52:])
+
+    cloud_top = max(senkou_a, senkou_b)
+    cloud_bottom = min(senkou_a, senkou_b)
+
+    # Chikou confirmation: current close > close[-26]
+    chikou_ok = False
+    if len(closes) >= 27:
+        chikou_ok = closes[-1] > closes[-27]
+
+    return {
+        "tenkan": tenkan,
+        "kijun": kijun,
+        "senkou_a": senkou_a,
+        "senkou_b": senkou_b,
+        "cloud_top": cloud_top,
+        "cloud_bottom": cloud_bottom,
+        "chikou_ok": chikou_ok,
+    }
+
+# ======================
+# CORE LOGIC
+# ======================
+async def refresh_tf_cache(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str, cache: Dict[str, Any]) -> None:
+    """
+    Cache ichida 1d/4h/15m closed candles + ichimoku lines saqlaydi.
+    """
+    cache.setdefault(symbol, {})
+
+    # intervals to refresh
+    for tf, limit in [("1d", 200), ("4h", 200), ("15m", 200)]:
+        # refresh cadence
+        entry = cache[symbol].get(tf)
+        tnow = now_ms()
+        if entry and (tnow - entry["t"] < int(REFRESH_KLINES_SEC * 1000)):
+            continue
+
+        candles = await get_klines(session, symbol, tf, limit)
+        closed = candles[:-1]  # forming removed
+        if len(closed) < 80:
+            cache[symbol][tf] = {"t": tnow, "closed": closed, "ichi": None}
+            continue
+
+        ichi = ichimoku_lines(closed)
+        cache[symbol][tf] = {"t": tnow, "closed": closed, "ichi": ichi}
+
+        ss = sym_state(st, symbol)
+        lc = closed[-1]
+        if tf == "1d":
+            ss["last_1d_closed_open"] = lc.open_time
+        elif tf == "4h":
+            ss["last_4h_closed_open"] = lc.open_time
+        elif tf == "15m":
+            ss["last_15m_closed_open"] = lc.open_time
+
+async def handle_signals(session: aiohttp.ClientSession, st: Dict[str, Any], symbol: str, price: float, cache: Dict[str, Any]) -> None:
+    ss = sym_state(st, symbol)
+    tf1 = cache.get(symbol, {}).get("1d", {})
+    tf4 = cache.get(symbol, {}).get("4h", {})
+    tf15 = cache.get(symbol, {}).get("15m", {})
+
+    ichi1 = tf1.get("ichi")
+    ichi4 = tf4.get("ichi")
+    ichi15 = tf15.get("ichi")
+
+    if not ichi1 or not ichi4 or not ichi15:
         return
 
-    for sym, w in ST.watch_1d_high.items():
-        price = prices.get(sym)
-        if price is None:
-            continue
+    # -----------------------
+    # 1D ARM (bullish yaqinlashish)
+    # -----------------------
+    closed1 = tf1["closed"]
+    last1 = closed1[-1]
+    setup_id = f"{symbol}:{last1.open_time}"  # current daily cycle
 
-        # tepaga yorib o'tsa -> retestda ham signal yo'q
-        if price >= w.level:
-            w.broken_up = True
-            continue
+    tenkan1 = ichi1["tenkan"]
+    kijun1 = ichi1["kijun"]
+    cloud_top1 = ichi1["cloud_top"]
+    cloud_green1 = ichi1["senkou_a"] > ichi1["senkou_b"]
+    chikou_ok1 = ichi1["chikou_ok"]
 
-        if w.sent or w.broken_up:
-            continue
+    # "yaqinlashsa" = close cloud_top'ga yaqin + bullish structure
+    near_level_1d = cloud_top1 * (1.0 - NEAR_D_PCT)
+    near_cloud_1d = (last1.close >= near_level_1d) and (last1.close < cloud_top1)
 
-        rem = remaining_pct_to_level(price, w.level)
-        if 0.0 <= rem <= NEAR_PCT:
-            w.sent = True
-            tg_send(
-                f"📈 <b>BUY</b> <b>{sym}</b>\n"
-                f"<b>1d high near</b> ({NEAR_PCT:.2f}%)\n"
-                f"Qolgan: <b>{rem:.4f}%</b>"
+    bullish_1d_near = (tenkan1 > kijun1) and cloud_green1 and chikou_ok1 and near_cloud_1d
+
+    # ARM only once per daily cycle
+    if bullish_1d_near and ss.get("setup_id") != setup_id and not ss.get("in_position"):
+        ss["setup_id"] = setup_id
+        ss["armed_1d"] = setup_id
+        ss["buy_done_4h"] = None
+        ss["sell_done_15m"] = None
+
+        remain_pct = (cloud_top1 - last1.close) / cloud_top1 * 100.0
+        await tg_send_text(
+            session,
+            f"🟨 ICHIMOKU ARM (1D bullish near)\n"
+            f"{symbol}\n"
+            f"1D close={last1.close}\n"
+            f"cloud_top={cloud_top1:.6f} | remain={remain_pct:.2f}% (near {NEAR_D_PCT*100:.2f}%)\n"
+            f"tenkan>kijun={tenkan1>kijun1} | cloud_green={cloud_green1} | chikou_ok={chikou_ok1}"
+        )
+
+    # -----------------------
+    # 4H BUY (only if armed)
+    # -----------------------
+    armed = ss.get("armed_1d") == ss.get("setup_id") and ss.get("setup_id") is not None
+    closed4 = tf4["closed"]
+    last4 = closed4[-1]
+
+    tenkan4 = ichi4["tenkan"]
+    kijun4 = ichi4["kijun"]
+    cloud_top4 = ichi4["cloud_top"]
+
+    buy_cond_4h = armed and (tenkan4 > kijun4) and (last4.close > cloud_top4)
+
+    if buy_cond_4h and not ss.get("in_position"):
+        # buy only once per setup_id
+        if ss.get("buy_done_4h") != ss.get("setup_id"):
+            ss["buy_done_4h"] = ss.get("setup_id")
+            ss["in_position"] = True
+            await tg_send_text(
+                session,
+                f"✅ BUY (Ichimoku 4H)\n"
+                f"{symbol}\n"
+                f"4H close={last4.close}\n"
+                f"cloud_top_4h={cloud_top4:.6f}\n"
+                f"tenkan>kijun={tenkan4>kijun4}"
             )
 
+    # -----------------------
+    # 15m SELL (only after BUY / in_position)
+    # -----------------------
+    if ss.get("in_position"):
+        closed15 = tf15["closed"]
+        last15 = closed15[-1]
 
-# =========================
-# MAIN
-# =========================
-def main():
-    global SPOT_USDT
+        tenkan15 = ichi15["tenkan"]
+        kijun15 = ichi15["kijun"]
 
-    print("[BOOT] loading SPOT universe...")
-    SPOT_USDT = load_spot_usdt_set()
-    print(f"[BOOT] spot_usdt={len(SPOT_USDT)}")
+        sell_cond_15m = (tenkan15 < kijun15) or (last15.close < kijun15)
 
-    ok = tg_send("✅ Top50: 1M+1W armed -> 1D high'ga 2% qolganda BUY bot start.")
-    print("[BOOT] telegram start msg:", ok)
+        if sell_cond_15m:
+            # sell only once per setup_id
+            if ss.get("sell_done_15m") != ss.get("setup_id"):
+                ss["sell_done_15m"] = ss.get("setup_id")
+                ss["in_position"] = False
+                await tg_send_text(
+                    session,
+                    f"🟥 SELL (Ichimoku 15m)\n"
+                    f"{symbol}\n"
+                    f"15m close={last15.close}\n"
+                    f"kijun_15m={kijun15:.6f}\n"
+                    f"tenkan<kijun={tenkan15<kijun15}"
+                )
 
-    # initial top + initial daily highs (hoziroq ishga tushsin)
-    refresh_top50(force=True)
-
-    # ---- STARTDA ARM QILIB OLISH (kutib o'tirmaslik uchun) ----
-    try:
-        ST.last_1m_close = last_closed_close_time(REF_SYMBOL, "1M")
-        ST.last_1w_close = last_closed_close_time(REF_SYMBOL, "1w")
-        ST.month_armed = True
-        ST.week_armed = True
-        print("[ARM] boot armed=True (1M+1W)")
-    except Exception as e:
-        print("[ARM] boot arm failed:", e)
-    # ----------------------------------------------------------
-
-    # startdayoq 1D cycle ni ishga tushirib, high larni yuklab olamiz
-    try:
-        ST.last_1d_close = last_closed_close_time(REF_SYMBOL, "1d")
-        on_daily_close()
-    except Exception as e:
-        print("[BOOT] initial daily load failed:", e)
-
-    last_prices_ts = 0.0
-    last_close_ts = 0.0
-    last_hb = 0.0
-    backoff = 1.0
-
+# ======================
+# LOOPS
+# ======================
+async def loop_refresh_top(session: aiohttp.ClientSession, st: Dict[str, Any]) -> None:
     while True:
         try:
-            now = time.time()
-
-            if now - last_hb >= HEARTBEAT_SEC:
-                last_hb = now
-                print(f"[HB] alive | armed={ST.month_armed and ST.week_armed} | top={len(ST.top_symbols)} | watch={len(ST.watch_1d_high)}")
-
-            refresh_top50(force=False)
-
-            # close checks (1M/1W/1D) — keyingi cycle lar uchun
-            if (now - last_close_ts) >= CLOSE_CHECK_SEC:
-                last_close_ts = now
-
-                cur_1m = last_closed_close_time(REF_SYMBOL, "1M")
-                if ST.last_1m_close is None:
-                    ST.last_1m_close = cur_1m
-                elif cur_1m != ST.last_1m_close:
-                    ST.last_1m_close = cur_1m
-                    on_monthly_close()
-
-                cur_1w = last_closed_close_time(REF_SYMBOL, "1w")
-                if ST.last_1w_close is None:
-                    ST.last_1w_close = cur_1w
-                elif cur_1w != ST.last_1w_close:
-                    ST.last_1w_close = cur_1w
-                    on_weekly_close()
-
-                cur_1d = last_closed_close_time(REF_SYMBOL, "1d")
-                if ST.last_1d_close is None:
-                    ST.last_1d_close = cur_1d
-                    on_daily_close()
-                elif cur_1d != ST.last_1d_close:
-                    ST.last_1d_close = cur_1d
-                    on_daily_close()
-
-            load_batch_1d_highs()
-
-            if (now - last_prices_ts) >= PRICE_REFRESH_SEC:
-                last_prices_ts = now
-                prices = fetch_all_prices()
-                check_signals(prices)
-
-            backoff = 1.0
-
+            syms = await get_top_gainers(session, TOP_N)
+            st["top_symbols"] = syms
+            st["last_top_refresh_ms"] = now_ms()
+            print(f"✅ Top {TOP_N} gainers updated. Tracking: {len(syms)}")
+            save_state(st)
         except Exception as e:
-            print("[ERROR]", e)
-            time.sleep(min(60.0, backoff))
-            backoff *= 2.0
+            await tg_send_text(session, f"⚠️ Top refresh error: {type(e).__name__}: {e}")
+        await asyncio.sleep(REFRESH_TOP_SEC)
 
-        time.sleep(LOOP_SLEEP_SEC)
+async def loop_refresh_klines(session: aiohttp.ClientSession, st: Dict[str, Any], cache: Dict[str, Any]) -> None:
+    while True:
+        syms = st.get("top_symbols") or []
+        if not syms:
+            await asyncio.sleep(2)
+            continue
+        for symbol in syms:
+            try:
+                await refresh_tf_cache(session, st, symbol, cache)
+            except Exception as e:
+                print("refresh_tf_cache error", symbol, e)
+        save_state(st)
+        await asyncio.sleep(REFRESH_KLINES_SEC)
 
+async def loop_prices(session: aiohttp.ClientSession, st: Dict[str, Any], cache: Dict[str, Any]) -> None:
+    while True:
+        syms = st.get("top_symbols") or []
+        if not syms:
+            await asyncio.sleep(1)
+            continue
+        try:
+            price_map = await get_price_map(session, syms)
+            for symbol, price in price_map.items():
+                try:
+                    await handle_signals(session, st, symbol, price, cache)
+                except Exception as e:
+                    print("signal error", symbol, e)
+            save_state(st)
+        except Exception as e:
+            await tg_send_text(session, f"⚠️ Price loop error: {type(e).__name__}: {e}")
+        await asyncio.sleep(SCAN_PRICE_SEC)
+
+async def main():
+    st = load_state()
+    cache: Dict[str, Any] = {}
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    connector = aiohttp.TCPConnector(limit=60, ssl=False)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        await tg_send_text(
+            session,
+            "🚀 Ichimoku bot started: Top50 gainers | 1D ARM (bullish near cloud) -> 4H BUY (close above cloud + tenkan>kijun) -> 15m SELL (tenkan<kijun or close<kijun)"
+        )
+
+        tasks = [
+            asyncio.create_task(loop_refresh_top(session, st)),
+            asyncio.create_task(loop_refresh_klines(session, st, cache)),
+            asyncio.create_task(loop_prices(session, st, cache)),
+        ]
+        await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
